@@ -10,21 +10,20 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
- * Level 4: Commutative Replicated State Machine (CRDT / Math-driven Join-Semilattice).
+ * Level 4: Striped Partitioned Counter (LongAdder / Commutative Algebraic Pattern).
  *
- * <p>Mathematical Foundations:
+ * <p><b>ARCHITECTURAL DISTINCTION & CLARIFICATION:</b>
+ * This engine implements a partitioned counter (identical in principle to Java 8's {@code LongAdder}).
+ * While mutation operations possess <b>Commutativity</b> ($a + b = b + a$) and <b>Associativity</b>
+ * ($(a + b) + c = a + (b + c)$):
  * <ul>
- *   <li>The state space forms a Join-Semilattice $\langle S, \sqcup \rangle$ where state updates
- *       satisfy:
- *       <ol>
- *         <li><b>Commutativity:</b> $x \sqcup y = y \sqcup x$ (order of mutation arrival is irrelevant)</li>
- *         <li><b>Associativity:</b> $(x \sqcup y) \sqcup z = x \sqcup (y \sqcup z)$ (batching boundaries are irrelevant)</li>
- *         <li><b>Idempotence:</b> $x \sqcup x = x$ (re-transmissions do not corrupt state)</li>
- *       </ol>
- *   </li>
- *   <li>No mailbox, no locks, no global CAS loops:
- *       Writers mutate their partitioned stripe locally without cross-thread coordination.</li>
- *   <li>Each stripe is cache-line padded to avoid MESI coherency crosstalk.</li>
+ *   <li><b>Not Idempotent:</b> Addition does NOT satisfy $x \sqcup x = x$. Delivering a delta twice corrupts state.</li>
+ *   <li><b>Not a Distributed CRDT:</b> There are no multi-node replicas and no explicit {@code merge()} lattice join.</li>
+ *   <li><b>Weak Consistency Read:</b> {@link #getState()} performs a non-atomic summation across stripes.
+ *       Comparing its raw throughput directly against linearizable CAS represents a classic consistency-versus-speed trade-off.</li>
+ *   <li><b>Memory Footprint Trade-off:</b> 64-byte padding per cell is appropriate for long-lived singleton
+ *       engines, but creates prohibitive memory bloat for short-lived, high-churn instances (such as
+ *       per-stream reactive subscriptions like {@code SequentialSubscription}).</li>
  * </ul>
  */
 public final class CommutativeCrdtEngine implements StateEngine {
@@ -100,7 +99,7 @@ public final class CommutativeCrdtEngine implements StateEngine {
 
     @Override
     public EngineType getType() {
-        return EngineType.COMMUTATIVE_CRDT;
+        return EngineType.STRIPED_COUNTER;
     }
 
     @Override

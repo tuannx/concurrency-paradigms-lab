@@ -54,6 +54,7 @@ public final class ConcurrencyEngine implements StateEngine {
                 return new ConcurrencyEngine(new WipDrainLoopEngine(cfg));
             case SMART_BATCHING_DISRUPTOR:
                 return new ConcurrencyEngine(new SmartBatchingDisruptorEngine(cfg));
+            case STRIPED_COUNTER:
             case COMMUTATIVE_CRDT:
                 return new ConcurrencyEngine(new CommutativeCrdtEngine(cfg));
             default:
@@ -87,8 +88,16 @@ public final class ConcurrencyEngine implements StateEngine {
         return create(EngineType.SMART_BATCHING_DISRUPTOR, config);
     }
 
+    public static ConcurrencyEngine stripedCounter(EngineConfig config) {
+        return create(EngineType.STRIPED_COUNTER, config);
+    }
+
+    /**
+     * @deprecated Use {@link #stripedCounter(EngineConfig)} instead.
+     */
+    @Deprecated
     public static ConcurrencyEngine crdt(EngineConfig config) {
-        return create(EngineType.COMMUTATIVE_CRDT, config);
+        return create(EngineType.STRIPED_COUNTER, config);
     }
 
     @Override

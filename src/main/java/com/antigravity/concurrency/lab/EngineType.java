@@ -17,9 +17,9 @@ public enum EngineType {
     ACTOR_MAILBOX,
 
     /**
-     * Level 2b: Cooperative Lock-Free Drain Loop (Work-In-Progress / WIP Trampoline).
-     * Inspired by ServiceTalk's SequentialSubscription.
+     * Level 2b: Cooperative Lock-Free Drain Loop (RxJava / Reactive Streams WIP Trampoline).
      * Zero-allocation, cooperative serialized execution using AtomicIntegerFieldUpdater.
+     * Note: Distinct from ServiceTalk's sentinel-CAS pattern.
      */
     WIP_DRAIN_LOOP,
 
@@ -31,8 +31,22 @@ public enum EngineType {
     SMART_BATCHING_DISRUPTOR,
 
     /**
-     * Level 4: Commutative Conflict-Free Replicated State Machine (CRDT / PN-Counter).
-     * Mathematically commutative and associative join-semilattice. Zero locks, zero coordination on write.
+     * Level 4: Striped Partitioned Counter (LongAdder / Commutative Math pattern).
+     *
+     * <p><b>Important Distinction:</b>
+     * This is a striped partitioned accumulator (similar to Java's {@code LongAdder}).
+     * While commutative ($a + b = b + a$) and associative ($(a+b)+c = a+(b+c)$), it is <b>NOT</b> a true CRDT:
+     * <ul>
+     *   <li>Addition is NOT idempotent ($x + x \neq x$).</li>
+     *   <li>It lacks an explicit replica {@code merge()} function.</li>
+     *   <li>{@code getState()} performs a non-atomic snapshot across stripes (weaker consistency than CAS).</li>
+     * </ul>
      */
+    STRIPED_COUNTER,
+
+    /**
+     * @deprecated Alias for {@link #STRIPED_COUNTER}. Kept for backward compatibility.
+     */
+    @Deprecated
     COMMUTATIVE_CRDT
 }

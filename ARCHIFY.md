@@ -1,7 +1,7 @@
 # Architectural Specification & Visual Blueprints (Archify Edition)
 ## Comparative Concurrency Paradigms: From CAS to Commutative State Machines
 
-This document provides architectural blueprints, hardware cache layout diagrams, and state-machine sequence flows for the five fundamental concurrency coordination models.
+This document provides architectural blueprints, hardware cache layout diagrams, and state-machine sequence flows for the fundamental concurrency coordination models, accompanied by an architectural post-mortem on Reactive Streams coordinators.
 
 ---
 
@@ -13,8 +13,8 @@ This document provides architectural blueprints, hardware cache layout diagrams,
 ====================================================================================================
 
   [ LEVEL 1: CAS LOOP ]         [ LEVEL 2a: ACTOR MAILBOX ]     [ LEVEL 2b: WIP DRAIN LOOP ]
-  Optimistic Multi-Writer       Pessimistic Single-Writer       Cooperative Trampoline (ServiceTalk)
-  -----------------------       -------------------------       ------------------------------------
+  Optimistic Multi-Writer       Pessimistic Single-Writer       Cooperative Trampoline (RxJava/Reactor)
+  -----------------------       -------------------------       ---------------------------------------
   Thread 1 ──┐                  Thread 1 ──┐                    Thread 1 ──┐ (Accumulate demand)
   Thread 2 ──┼─► [CAS State]    Thread 2 ──┼─► [Queue] ──► [Actor] Thread 2 ─┼─► [WIP State] ─► [Active]
   Thread 3 ──┘ (MESI Storm)     Thread 3 ──┘   (1-by-1 worker)  Thread 3 ──┘ (Zero thread switch)
@@ -25,12 +25,12 @@ This document provides architectural blueprints, hardware cache layout diagrams,
 
                                              │
                                              ▼
-  [ LEVEL 3: SMART-BATCHING DISRUPTOR ]                         [ LEVEL 4: COMMUTATIVE CRDT ]
-  Mechanical Sympathy & Group Commit                            Conflict-Free Semilattice Math
-  ----------------------------------                            ------------------------------
+  [ LEVEL 3: SMART-BATCHING DISRUPTOR ]                         [ LEVEL 4: STRIPED COUNTER ]
+  Mechanical Sympathy & Group Commit                            Partitioned Commutative Math (LongAdder)
+  ----------------------------------                            ----------------------------------------
   Thread 1 ──┐  RingBuffer (Padded 64B)   Batch Drain           Thread 1 ──► [Partition 0] ──┐
-  Thread 2 ──┼─► [Slot 0][Slot 1][Slot 2] ─────────► [Single]   Thread 2 ──► [Partition 1] ──┼─► Converged
-  Thread 3 ──┘   Pre-allocated, Zero-GC               Writer    Thread 3 ──► [Partition 2] ──┘    State
+  Thread 2 ──┼─► [Slot 0][Slot 1][Slot 2] ─────────► [Single]   Thread 2 ──► [Partition 1] ──┼─► Non-atomic
+  Thread 3 ──┘   Pre-allocated, Zero-GC               Writer    Thread 3 ──► [Partition 2] ──┘   Snapshot
        │                                                │                    │
        ▼                                                ▼                    ▼
   1 State Transition per Batch (L1 Cache) ──► 1 Amortized Fsync   Zero-Coordination Writes!
@@ -86,6 +86,8 @@ Cache Line 2 (64 Bytes) - DEDICATED TO CONSUMER:
                                ▲ Core 2 updates here without invalidating Cache Line 1
 ```
 
+> **Microarchitectural Caveat:** 64-byte padding is advantageous for **long-lived singleton partition engines** (Disruptor, TigerBeetle), but represents an anti-pattern for **short-lived per-subscription stream instances** (like `SequentialSubscription`), where thousands of instances are created per second with hot paths under ~16 ns/op.
+
 ---
 
 ## 3. Sequence Flows & State Transition Mechanics
@@ -114,7 +116,7 @@ sequenceDiagram
 
 ---
 
-### 3.2 Level 2b: ServiceTalk `SequentialSubscription` / WIP Trampoline Flow
+### 3.2 Level 2b: WIP Trampoline Drain Loop (RxJava / Reactor Pattern)
 
 ```mermaid
 sequenceDiagram
@@ -175,36 +177,49 @@ sequenceDiagram
 
 ---
 
-### 3.4 Level 4: Commutative CRDT (Join-Semilattice)
+### 3.4 Case Study: Monotonicity Breakdown of `SequentialSubscription`
+
+Why `SequentialSubscription` **cannot be converted to a CRDT**:
 
 ```mermaid
 graph TD
-    subgraph MultiCoreWriters ["Zero-Coordination Multi-Core Writers"]
-        T1["Thread 1 / Core 1"] -->|Add delta| P0["Stripe [0] (Padded 64B)"]
-        T2["Thread 2 / Core 2"] -->|Add delta| P1["Stripe [1] (Padded 64B)"]
-        T3["Thread 3 / Core 3"] -->|Add delta| P2["Stripe [2] (Padded 64B)"]
-        T4["Thread 4 / Core 4"] -->|Add delta| P3["Stripe [3] (Padded 64B)"]
+    subgraph Monotonic ["Monotonic Components (No Coordination Needed)"]
+        REQ["requested: Saturating Addition (accumulateAndGet)"]
+        EMIT["sourceEmitted: Single-writer monotonic increment"]
+        CAN["cancelled: Monotonic Boolean OR (False -> True)"]
     end
 
-    subgraph ConvergenceMath ["Join-Semilattice Convergence: f(A, B) = f(B, A)"]
-        P0 -.->|Associative Sum| SUM["Read / Reconciliation Join: Σ Stripes"]
-        P1 -.->|Associative Sum| SUM
-        P2 -.->|Associative Sum| SUM
-        P3 -.->|Associative Sum| SUM
+    subgraph NonMonotonic ["Non-Monotonic & External Effects (Strict Coordination Required)"]
+        SW["switchTo(next): Destination change & baseline reset (CALM theorem)"]
+        DELIV["source.request(delta): External Side-Effect (Non-idempotent, RS §2.7)"]
+        CANCEL_EFF["source.cancel(): Exactly-once delivery"]
     end
 
-    SUM --> BAL["Final Converged Balance"]
+    REQ -.->|Feeds demand| DELIV
+    SW -->|Resets destination| DELIV
+    CAN -->|Triggers once| CANCEL_EFF
+
+    style NonMonotonic fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style Monotonic fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 ```
+
+| Component | Forms a Lattice? | Coordination Required? | Architectural Reason |
+|---|---|---|---|
+| `requested` | **Yes** (Saturating add; invalid is top $\top$) | **No** | Atomic `accumulateAndGet` |
+| `cancelled` | **Yes** (Monotonic false $\to$ true / boolean OR) | **For effect only** | Atomic `getAndSet` to trigger `cancel()` once |
+| `sourceEmitted` | **Yes** (Single-writer on Subscriber thread) | **No** | Primitive `++sourceEmitted` |
+| `Current source delivered level` | Monotonic only as a pair: $(\text{generation}, \text{delivered})$ | **Yes** | Winning permit to deliver delta |
+| **Delivering request / cancel to source** | **NO** (External side-effect, non-idempotent) | **YES** | **Drain loop or Explicit Lock (PR #3677)** |
 
 ---
 
-## 4. Analytical Comparison Table
+## 5. Analytical Comparison Table
 
-| Architecture Pillar | CAS Loop (Level 1) | Actor Mailbox (Level 2a) | WIP Drain Loop (Level 2b) | Smart-Batching (Level 3) | Commutative CRDT (Level 4) |
+| Architecture Pillar | CAS Loop (Level 1) | Actor Mailbox (Level 2a) | WIP Drain Loop (Level 2b) | Smart-Batching (Level 3) | Striped Counter (Level 4) |
 |---|---|---|---|---|---|
-| **Coordination Type** | Optimistic Multi-Writer | Pessimistic Single-Writer | Cooperative Trampoline | Pipelined Single-Writer | Math-driven (Semilattice) |
+| **Coordination Type** | Optimistic Multi-Writer | Pessimistic Single-Writer | Cooperative Trampoline | Pipelined Single-Writer | Partitioned Commutative Math |
 | **Hardware Contention** | Severe (MESI Invalidation) | High (Queue Head/Tail CAS) | Low (Cooperative Hand-off) | Zero (Cache Padded Ring) | Zero (Partition Striping) |
 | **Thread Context Switches** | 0 (Busy spin) | 2 per message (Producer/Actor) | 0 (Calling thread drains) | Minimal (Dedicated Core) | 0 (Calling thread mutates) |
 | **Object Allocation** | Zero | 1 Command object/msg | Minimal (Queue reference) | Zero (Preallocated slots) | Zero |
 | **I/O Amortization** | $1 \times \text{I/O}$ per op | $1 \times \text{I/O}$ per op | 1 I/O per cooperative turn | **1 Group Commit for N ops** | Partitioned async flush |
-| **Scalability Limit** | Contention collapse at $>8$ cores | Queue & I/O throughput ceiling | Linear lock-free drain limit | **Hardware memory bus bandwidth** | **Near-Infinite (Embarrassingly parallel)** |
+| **Consistency Level** | Linearizable | Serialized | Serialized | Serialized | **Weak (Non-atomic read sum)** |

@@ -162,6 +162,7 @@ public final class ConcurrencyLoadTestHarness {
         EngineConfig inMemoryConfig = EngineConfig.defaultInMemory();
 
         for (EngineType type : EngineType.values()) {
+            if (type == EngineType.COMMUTATIVE_CRDT) continue;
             System.out.print("  -> Testing " + type + "... ");
             System.out.flush();
             TestResult res = runBenchmark(type, inMemoryConfig, 16, 40000, "In-Memory High Contention");
@@ -176,6 +177,7 @@ public final class ConcurrencyLoadTestHarness {
         EngineConfig ioConfig = EngineConfig.withSimulatedIo(20);
 
         for (EngineType type : EngineType.values()) {
+            if (type == EngineType.COMMUTATIVE_CRDT) continue;
             System.out.print("  -> Testing " + type + "... ");
             System.out.flush();
             TestResult res = runBenchmark(type, ioConfig, 8, 2500, "Simulated I/O Persistence (20µs)");

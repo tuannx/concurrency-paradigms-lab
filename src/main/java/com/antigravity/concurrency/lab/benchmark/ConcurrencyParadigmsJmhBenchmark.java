@@ -42,7 +42,7 @@ public class ConcurrencyParadigmsJmhBenchmark {
             mailboxEngine = ConcurrencyEngine.create(EngineType.ACTOR_MAILBOX, cfg);
             drainEngine = ConcurrencyEngine.create(EngineType.WIP_DRAIN_LOOP, cfg);
             disruptorEngine = ConcurrencyEngine.create(EngineType.SMART_BATCHING_DISRUPTOR, cfg);
-            crdtEngine = ConcurrencyEngine.create(EngineType.COMMUTATIVE_CRDT, cfg);
+            crdtEngine = ConcurrencyEngine.create(EngineType.STRIPED_COUNTER, cfg);
         }
 
         @TearDown(Level.Trial)

@@ -86,5 +86,22 @@ public class ConcurrencyEngineTest {
         seqSub.switchTo(mockSub2);
         // Sub2 receives the cumulative pending demand since 0 items were emitted
         assertEquals(15L, requestedReceivedSub2.get());
+
+        // Verify Reactive Streams §3.9: non-positive request forwarded to source
+        AtomicLong invalidDemandReceived = new AtomicLong();
+        SequentialSubscriptionExplained.Subscription mockSub3 = new SequentialSubscriptionExplained.Subscription() {
+            @Override
+            public void request(long n) {
+                if (n <= 0) {
+                    invalidDemandReceived.set(n);
+                }
+            }
+
+            @Override
+            public void cancel() {}
+        };
+        SequentialSubscriptionExplained seqSub3 = new SequentialSubscriptionExplained(mockSub3);
+        seqSub3.request(-10);
+        assertEquals(Long.MIN_VALUE, invalidDemandReceived.get());
     }
 }

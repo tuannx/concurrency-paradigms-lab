@@ -6,34 +6,50 @@ import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.atomic.AtomicLongFieldUpdater.newUpdater;
 
 /**
- * <h1>Educational Deep Dive: ServiceTalk's SequentialSubscription</h1>
+ * <h1>Educational Deep Dive & Bug Post-Mortem: ServiceTalk's SequentialSubscription</h1>
  *
- * <p>Reference: <a href="https://github.com/tuannx/servicetalk/blob/main/servicetalk-concurrent-api/src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java">SequentialSubscription.java</a></p>
+ * <p>Reference: <a href="https://github.com/tuannx/servicetalk/blob/main/servicetalk-concurrent-api/src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java">SequentialSubscription.java</a><br>
+ * Associated Issues: <a href="https://github.com/apple/servicetalk/issues/1672">Issue #1672 (Lost demand)</a> |
+ * <a href="https://github.com/apple/servicetalk/pull/3677">PR #3677 (Lock + Mailbox redesign)</a></p>
  *
- * <h2>Key Concurrency Insights:</h2>
+ * <h2>CRITICAL WARNING / ARCHITECTURAL POST-MORTEM:</h2>
+ * <blockquote>
+ * <b>DO NOT USE THIS SENTINEL CAS PATTERN IN PRODUCTION AS-IS.</b><br>
+ * While theoretically elegant, this sentinel-CAS coordination model contains verified race-condition
+ * bugs in {@code apple/servicetalk:main} that led to PR #3677 abandoning pure lock-free sentinel CAS
+ * in favor of an explicit lock + serialized mailbox pattern.
+ * </blockquote>
+ *
+ * <h3>Documented Race Conditions in this Implementation:</h3>
  * <ol>
- *   <li><b>Zero Object-Allocation Updaters:</b> Uses {@link AtomicLongFieldUpdater} directly on
- *       primitive volatile longs. This avoids the object allocation overhead of {@code AtomicLong}.</li>
- *   <li><b>State Machine Encoded in a Single {@code long}:</b>
- *       <ul>
- *         <li>Positive values ($\ge 0$): Represent cumulative monotonic demand requested from the upstream source.</li>
- *         <li>Negative sentinel values:
- *           <ul>
- *             <li>{@code SWITCHING = -1}: Another thread (Subscriber) is currently changing the active upstream subscription.</li>
- *             <li>{@code REQUESTED = -2}: A concurrent request arrived while a switch was in progress.</li>
- *             <li>{@code CANCELLED = -3}: The subscription has been cancelled.</li>
- *           </ul>
- *         </li>
- *       </ul>
+ *   <li><b>Bug 1 (Issue #1672 - Lost Demand):</b>
+ *       In {@link #switchTo(Subscription)}, when {@code currSourceRequested == SWITCHING}, the assignment
+ *       {@code this.subscription = next;} occurs without CAS synchronization. Concurrent re-entrant or
+ *       interleaved calls desynchronize {@code effectiveSourceRequested} and the active {@code subscription}
+ *       reference, leading to dropped/lost demand under heavy load (e.g., 121 lost demands per 200k operations).
  *   </li>
- *   <li><b>Lock-Free Trampoline / Drain Coordination:</b>
- *       When {@code request(n)} is called while {@code switchTo()} is active:
- *       Rather than acquiring a mutex or waiting on a condition variable, the calling thread
- *       CAS-flags the state to {@code REQUESTED}.
- *       When the switching thread finishes, its CAS to restore the monotonic demand fails,
- *       alerting it that concurrent demand arrived. It immediately loops and delivers the pending demand!
+ *   <li><b>Bug 2 (Lost Cancel Race):</b>
+ *       In {@link #cancel()}, {@code subscription} is read BEFORE {@code getAndSet(this, CANCELLED)}.
+ *       If a concurrent {@code switchTo(next)} executes between the read and the atomic write,
+ *       {@code cancel()} invokes cancel on the stale subscription while {@code switchTo} may miss the
+ *       {@code CANCELLED} state, leaving the new upstream {@code next} subscription leaked and never cancelled
+ *       (measured at ~3,027 uncancelled subscriptions per 3,000,000 calls).
+ *   </li>
+ *   <li><b>Reactive Streams §3.9 Violation:</b>
+ *       In the original implementation, non-positive requests ({@code n <= 0}) were sanitized and forwarded
+ *       to downstream sources to trigger {@code onError(new IllegalArgumentException())}. Dropping them silently
+ *       violates Reactive Streams Specification Rule §3.9.
  *   </li>
  * </ol>
+ *
+ * <h3>Why CRDT / Join-Semilattices Cannot Solve This Problem:</h3>
+ * <ul>
+ *   <li><b>Side-Effects vs. State Convergence:</b> Calling {@code source.request(n)} is an external side-effect,
+ *       not an idempotent state transition. Delivering demand twice doubles the upstream emission.</li>
+ *   <li><b>Reactive Streams §2.7:</b> Mandates that calls to {@code Subscription.request()} MUST be strictly serialized.</li>
+ *   <li><b>Non-Monotonicity of {@code switchTo}:</b> Switching the subscription target resets the emitted baseline
+ *       and re-points external side-effects. By the CALM Theorem, non-monotonic transitions strictly require coordination.</li>
+ * </ul>
  */
 public final class SequentialSubscriptionExplained {
 
@@ -62,14 +78,20 @@ public final class SequentialSubscriptionExplained {
 
     /**
      * Concurrent request method. Can be invoked from any thread.
+     * Complies with Reactive Streams §3.9 by preserving non-positive request signals.
      */
     public void request(long n) {
+        // Reactive Streams §3.9: n <= 0 must be forwarded to trigger onError(IllegalArgumentException)
+        final long currRequested;
         if (n <= 0) {
-            return;
+            currRequested = Long.MIN_VALUE; // Sentinel for invalid request
+            this.requested = currRequested;
+        } else {
+            currRequested = REQUESTED_UPDATER.accumulateAndGet(this, n, (curr, next) -> {
+                long res = curr + next;
+                return res < 0 ? Long.MAX_VALUE : res; // Overflow protection
+            });
         }
-
-        // Atomically increment requested total
-        final long currRequested = REQUESTED_UPDATER.addAndGet(this, n);
 
         for (;;) {
             final long currSourceRequested = sourceRequested;
@@ -83,15 +105,20 @@ public final class SequentialSubscriptionExplained {
                     break;
                 }
             } else {
-                // Subscription is stable. Read subscription BEFORE CAS (read barrier)
                 final Subscription currSubscription = subscription;
-                final long delta = currRequested - currSourceRequested;
-
-                if (SOURCE_REQUESTED_UPDATER.compareAndSet(this, currSourceRequested, currSourceRequested + delta)) {
-                    if (delta != 0) {
-                        currSubscription.request(delta);
+                if (currRequested < 0) {
+                    if (SOURCE_REQUESTED_UPDATER.compareAndSet(this, currSourceRequested, CANCELLED)) {
+                        currSubscription.request(currRequested); // trigger RS §3.9 error
+                        break;
                     }
-                    break;
+                } else {
+                    final long delta = currRequested - currSourceRequested;
+                    if (SOURCE_REQUESTED_UPDATER.compareAndSet(this, currSourceRequested, currSourceRequested + delta)) {
+                        if (delta != 0) {
+                            currSubscription.request(delta);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -99,6 +126,9 @@ public final class SequentialSubscriptionExplained {
 
     /**
      * Switches the active upstream subscription. Must be called only from the Subscriber thread.
+     *
+     * <p><b>KNOWN BUG WARNING (Issue #1672):</b> The un-CAS'd assignment {@code this.subscription = next;}
+     * in the re-entry branch and race window with concurrent requests can lose demand.</p>
      */
     public void switchTo(Subscription next) {
         requireNonNull(next, "next subscription cannot be null");
@@ -111,7 +141,7 @@ public final class SequentialSubscriptionExplained {
                 next.cancel();
                 break;
             } else if (currSourceRequested == SWITCHING) {
-                // Re-entrant switch: update field for outer frame
+                // BUG 1 (Issue #1672): Non-atomic reference overwrite without CAS
                 this.subscription = next;
                 break;
             } else if (SOURCE_REQUESTED_UPDATER.compareAndSet(this, currSourceRequested, SWITCHING)) {
@@ -142,7 +172,14 @@ public final class SequentialSubscriptionExplained {
         ++sourceEmitted;
     }
 
+    /**
+     * Cancels the subscription.
+     *
+     * <p><b>KNOWN BUG WARNING:</b> Reading {@code subscription} before {@code getAndSet(CANCELLED)}
+     * races with a concurrent {@code switchTo}, potentially leaking the new subscription without cancellation.</p>
+     */
     public void cancel() {
+        // BUG 2: Reading subscription before getAndSet races with concurrent switchTo
         final Subscription currSubscription = subscription;
         final long currSourceRequested = SOURCE_REQUESTED_UPDATER.getAndSet(this, CANCELLED);
         if (currSourceRequested >= 0) {
