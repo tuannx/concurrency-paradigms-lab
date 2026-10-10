@@ -1,4 +1,4 @@
-package com.antigravity.concurrency.lab.core.crdt;
+package com.antigravity.concurrency.lab.core.striped;
 
 import com.antigravity.concurrency.lab.EngineConfig;
 import com.antigravity.concurrency.lab.EngineMetrics;
@@ -10,23 +10,25 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
- * Level 4: Striped Partitioned Counter (LongAdder / Commutative Algebraic Pattern).
+ * Level 4: Striped Partitioned Counter (LongAdder-style commutative accumulation).
  *
- * <p><b>ARCHITECTURAL DISTINCTION & CLARIFICATION:</b>
- * This engine implements a partitioned counter (identical in principle to Java 8's {@code LongAdder}).
- * While mutation operations possess <b>Commutativity</b> ($a + b = b + a$) and <b>Associativity</b>
- * ($(a + b) + c = a + (b + c)$):
+ * <p><b>What this is, and is not:</b>
+ * A fixed array of cache-line padded cells; each thread adds to the cell picked by its thread id. Similar in spirit to
+ * Java 8's {@code LongAdder}, which additionally grows its cells and re-hashes threads under contention.
+ * Additions are commutative ($a + b = b + a$) and associative ($(a + b) + c = a + (b + c)$), but:
  * <ul>
- *   <li><b>Not Idempotent:</b> Addition does NOT satisfy $x \sqcup x = x$. Delivering a delta twice corrupts state.</li>
- *   <li><b>Not a Distributed CRDT:</b> There are no multi-node replicas and no explicit {@code merge()} lattice join.</li>
- *   <li><b>Weak Consistency Read:</b> {@link #getState()} performs a non-atomic summation across stripes.
- *       Comparing its raw throughput directly against linearizable CAS represents a classic consistency-versus-speed trade-off.</li>
- *   <li><b>Memory Footprint Trade-off:</b> 64-byte padding per cell is appropriate for long-lived singleton
- *       engines, but creates prohibitive memory bloat for short-lived, high-churn instances (such as
- *       per-stream reactive subscriptions like {@code SequentialSubscription}).</li>
+ *   <li><b>Not idempotent:</b> applying the same delta twice counts it twice ($x + x \neq x$).</li>
+ *   <li><b>Not a CRDT:</b> there are no replicas and no lattice {@code merge()}. A state-based G-Counter would keep
+ *       one entry per replica and merge with a pointwise max.</li>
+ *   <li><b>Weakly consistent reads:</b> {@link #getState()} sums the cells non-atomically, so the value returned by
+ *       {@link #mutate(long)} is a snapshot, not the value right after this update. CAS returns the exact
+ *       post-update value; compare their throughput with that in mind.</li>
+ *   <li><b>Memory:</b> 64-byte padding per cell suits long-lived singleton engines, not short-lived per-stream
+ *       objects (such as {@code SequentialSubscription}).</li>
+ *   <li><b>Collisions:</b> threads whose ids share the low bits share a cell and contend on it.</li>
  * </ul>
  */
-public final class CommutativeCrdtEngine implements StateEngine {
+public final class StripedCounterEngine implements StateEngine {
 
     /**
      * Cache-line padded counter cell to eliminate false sharing between stripes.
@@ -53,9 +55,9 @@ public final class CommutativeCrdtEngine implements StateEngine {
     private final PaddedCell[] partitions;
     private final int mask;
 
-    public CommutativeCrdtEngine(EngineConfig config) {
+    public StripedCounterEngine(EngineConfig config) {
         this.config = config;
-        int numPartitions = findNextPowerOfTwo(config.getCrdtPartitions());
+        int numPartitions = findNextPowerOfTwo(config.getStripeCount());
         this.mask = numPartitions - 1;
         this.partitions = new PaddedCell[numPartitions];
         for (int i = 0; i < numPartitions; i++) {
@@ -67,24 +69,24 @@ public final class CommutativeCrdtEngine implements StateEngine {
     public CompletableFuture<Long> mutate(long delta) {
         metrics.recordSubmitted();
 
-        // Map calling thread to its designated partition stripe
+        // Map calling thread to a stripe (threads with the same low id bits share one)
         int stripe = (int) (Thread.currentThread().getId() & mask);
         partitions[stripe].add(delta);
 
         if (config.getSimulatedIoMicros() > 0) {
-            // Local partition persistence without global barrier
+            // Each caller persists on its own thread: I/O runs in parallel and unordered across callers
             SimulatedIo.execute(config.getSimulatedIoMicros());
         }
 
         metrics.recordSuccess();
 
-        // In CRDT, reads converge via semilattice join (sum across all stripes)
+        // Non-atomic snapshot sum, not the exact value right after this update
         return CompletableFuture.completedFuture(getState());
     }
 
     @Override
     public long getState() {
-        // Semilattice join / reconciliation: associative summation
+        // Sum of the stripes; cells may change while they are read
         long total = 0L;
         for (PaddedCell cell : partitions) {
             total += cell.get();
@@ -104,7 +106,7 @@ public final class CommutativeCrdtEngine implements StateEngine {
 
     @Override
     public void close() {
-        // Stateless partitions require no active background threads
+        // No background threads
     }
 
     private static int findNextPowerOfTwo(int value) {

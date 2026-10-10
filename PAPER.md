@@ -2,7 +2,7 @@
 
 **Author:** Technical Architecture & High-Performance Computing Lab  
 **Target Specification:** Java 8+ / Modern Multicore Microarchitectures (x86-64 & AArch64)  
-**Reference Codebase & Case Study:** Apple ServiceTalk [`SequentialSubscription.java`](https://github.com/apple/servicetalk/blob/main/servicetalk-concurrent-api/src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java)  
+**Reference Codebase & Case Study:** Apple ServiceTalk [`SequentialSubscription.java` @ e1704cb](https://github.com/apple/servicetalk/blob/e1704cb9d14bdc499e2f9bd471f3572592538a52/servicetalk-concurrent-api/src/main/java/io/servicetalk/concurrent/api/SequentialSubscription.java) (the version analysed; `main` may change)  
 **Associated Post-Mortem:** [ServiceTalk Issue #1672](https://github.com/apple/servicetalk/issues/1672) | [ServiceTalk PR #3677](https://github.com/apple/servicetalk/pull/3677)
 
 ---
@@ -18,7 +18,7 @@ This paper provides an end-to-end mathematical, microarchitectural, and empirica
 4. **Level 3: Pipelined Smart-Batching Single-Writer (LMAX Disruptor & TigerBeetle Group Commit)**
 5. **Level 4: Striped Partitioned Counter (Commutative Algebra / LongAdder Pattern)**
 
-Furthermore, this paper includes an in-depth **Architectural Post-Mortem** analyzing why Apple ServiceTalk's original sentinel-CAS implementation of `SequentialSubscription` suffered from race conditions (#1672, lost cancels) and why applying Conflict-Free Replicated Data Types (CRDTs) to such stream coordinators is a fundamental category error.
+Furthermore, this paper includes an in-depth **Architectural Post-Mortem** analyzing the known races in Apple ServiceTalk's sentinel-CAS implementation of `SequentialSubscription` (#1672 lost demand, a lost-cancel window) and why Conflict-Free Replicated Data Types (CRDTs) are not a fit for such stream coordinators.
 
 ---
 
@@ -45,7 +45,7 @@ hardware cache controllers treat them as conflicting, triggering false cache inv
 
 > [!NOTE]
 > **Allocation & Footprint Trade-off:**
-> While 64-byte padding is essential for **long-lived singleton partition engines** (such as Disruptor RingBuffers or TigerBeetle event loops), applying padding to **short-lived, high-churn objects** (such as per-subscription reactive streams instances like `SequentialSubscription`) creates severe heap memory bloat for no gain, since those instances typically experience low cross-core contention and hot-path execution around ~16 ns/op.
+> While 64-byte padding is essential for **long-lived singleton partition engines** (such as Disruptor RingBuffers or TigerBeetle event loops), applying padding to **short-lived, high-churn objects** (such as per-subscription reactive streams instances like `SequentialSubscription`) creates severe heap memory bloat for no gain, since those instances see low cross-core contention and a short hot path (~16 ns/op measured for `request(1)` through the drain loop of a local build of the PR #3677 design, single thread, Apple M1 Max).
 
 ---
 
@@ -97,17 +97,17 @@ In Apple ServiceTalk (`io.servicetalk.concurrent.api.SequentialSubscription`), c
 
 #### Documented Production Bugs in the Sentinel-CAS Pattern:
 1. **Issue #1672 (Lost Demand):**
-   In `switchTo(Subscription next)`, if `currSourceRequested == SWITCHING`, the assignment `this.subscription = next;` was executed without CAS coordination. Under concurrent re-entry or interleaved requests, the baseline `effectiveSourceRequested` and the active subscription reference desynchronized, causing demand to be permanently lost (measured at 121 lost demands per 200,000 operations).
+   In `switchTo(Subscription next)`, the `currSourceRequested == SWITCHING` branch only stores `subscription = next`. It exists for same-thread re-entry (a source completing inside `request(n)`), where the outer frame delivers demand when the stack unwinds. A `switchTo` from *another* thread (e.g. a resubscribe scheduled on a timer thread by `retryWhen`/`repeatWhen`) that overlaps an earlier, still-unwinding `switchTo` takes the same branch, and the new subscription can end up with no `request(n)`: the stream hangs. Measured on ServiceTalk's class: 121 of 200,000 iterations lost demand in a local micro-stress.
 2. **Lost Cancel Race Condition:**
-   In `cancel()`, `subscription` was read *before* executing `sourceRequestedUpdater.getAndSet(this, CANCELLED)`. If a concurrent `switchTo` replaced the subscription between the read and the `getAndSet`, the cancel was delivered to the stale subscription while `switchTo` bypassed the cancellation check, permanently leaking uncancelled upstream subscriptions (measured at 3,027 uncancelled subscriptions per 3,000,000 operations).
-3. **The Solution (PR #3677):**
-   ServiceTalk abandoned pure lock-free sentinel CAS for `SequentialSubscription`, transitioning to an **explicit lock + serialized mailbox pattern** to ensure provable correctness and zero race conditions.
+   In `cancel()`, `subscription` is read *before* `sourceRequestedUpdater.getAndSet(this, CANCELLED)`. If a concurrent `switchTo` completes in between, the stale subscription is cancelled and the new one is never cancelled. Measured on ServiceTalk's class: 3,027 of 3,000,000 iterations in a local two-thread harness.
+3. **Proposed Fix (PR #3677, open and under review):**
+   Replace the sentinel CAS with ServiceTalk's non-blocking drain lock (`ConcurrentUtils.tryAcquireLock`/`releaseLock`: a thread that loses the race marks pending work and returns, it never blocks) plus an atomic mailbox for the next subscription, so one drain owner delivers demand. Reviewers asked to keep `cancel()` outside the lock, as on `main`, so a cancel reaches a source that is blocked inside `request(n)`. The PR is not merged; its correctness is still being reviewed.
 
 ---
 
 ### 3.2 Theoretical Analysis: Why CRDTs Cannot Solve `SequentialSubscription`
 
-A tempting architectural hypothesis is whether `SequentialSubscription` could be converted into a Conflict-Free Replicated Data Type (CRDT) to eliminate locks. A rigorous analysis proves that **CRDT-izing `SequentialSubscription` is impossible and conceptually unsound**:
+A tempting architectural hypothesis is whether `SequentialSubscription` could be converted into a Conflict-Free Replicated Data Type (CRDT) to eliminate locks. The analysis below argues that **a CRDT is not a fit for `SequentialSubscription`**:
 
 #### 1. No Distributed Replicas to Converge
 CRDTs exist to resolve eventual consistency across independent, distributed replicas. In `SequentialSubscription`, there is only a single object residing in a single JVM process. Reducing "CRDT" to a single process merely yields commutative atomic updates, which the class already utilizes where appropriate (e.g., `accumulateAndGet`).
@@ -115,14 +115,14 @@ CRDTs exist to resolve eventual consistency across independent, distributed repl
 #### 2. Delivering Side-Effects vs. Converging State
 The purpose of `SequentialSubscription` is **delivering external side-effects** (`source.request(delta)`, `source.cancel()`), not converging mathematical state:
 - `source.request(delta)` is strictly **non-idempotent**: invoking it twice doubles upstream emission.
-- **Reactive Streams Specification Rule §2.7** mandates that calls to `Subscription.request()` MUST be strictly serialized.
+- **Reactive Streams Rule §2.7:** a Subscriber MUST ensure that all calls on its Subscription's `request` and `cancel` methods are performed serially. (`main` lets `cancel()` run concurrently with `request(n)`; PR #3677's reviewers asked it to keep that behaviour for now and to defer this until blocking `request(n)` implementations are audited.)
 - Deciding which thread delivers which delta, exactly once, to the active upstream source requires winning an execution turn (`getAndSet` or lock). Commutative algebraic merges cannot make this decision.
 
 #### 3. `switchTo` is Fundamentally Non-Monotonic
-`switchTo` alters the destination of future demand and resets the emission baseline (`sourceEmitted`). Under the **CALM Theorem** (Consistency as Logical Monotonicity):
-- Monotonic operations do not require coordination.
-- **Non-monotonic operations strictly require coordination**.
-Because switching upstream sources is non-monotonic, coordination (locks or serialized drain loops) is mathematically unavoidable.
+`switchTo` alters the destination of future demand and resets the emission baseline (`sourceEmitted`). By analogy with the **CALM Theorem** (Consistency as Logical Monotonicity, stated for distributed programs):
+- Monotonic operations can run without coordination.
+- **Non-monotonic operations need coordination**.
+Because switching upstream sources is non-monotonic, some coordination (a serialized drain owner, or CAS-based claims) is needed.
 
 #### 4. Component Monotonicity Breakdown
 
@@ -132,7 +132,7 @@ Because switching upstream sources is non-monotonic, coordination (locks or seri
 | `cancelled` | **Yes** (Monotonic false $\to$ true / boolean OR) | **For effect only** | Atomic `getAndSet` to trigger `cancel()` once |
 | `sourceEmitted` | **Yes** (Single-writer on Subscriber thread, monotonic) | **No** | Primitive `++sourceEmitted` |
 | `Current source delivered level` | Monotonic only as a pair: $(\text{generation}, \text{delivered})$ | **Yes** | Winning permit to deliver delta |
-| **Delivering request / cancel to source** | **NO** (External side-effect, non-idempotent) | **YES** | **Drain loop or Explicit Lock (PR #3677)** |
+| **Delivering request / cancel to source** | **NO** (External side-effect, non-idempotent) | **YES** | **Serialized delivery: sentinel CAS on `main`; non-blocking `tryAcquireLock` drain + mailbox in PR #3677** |
 
 ---
 
@@ -140,12 +140,15 @@ Because switching upstream sources is non-monotonic, coordination (locks or seri
 
 While `SequentialSubscription` cannot be implemented as a CRDT, viewing demand through a **lattice lens** yields two rigorous mathematical invariants for randomized concurrency testing:
 
+Notation: $R$ is the total (valid, saturating) demand requested by the downstream; $B_k$ is `sourceEmitted` at the moment source $k$ is installed (its baseline); $D_k$ is the total demand delivered to source $k$ via `request(n)`.
+
 1. **Safety Invariant (No Duplication):**  
-   No upstream source receives more demand than the total requested minus what has already been accounted for.
-   $$\sum \text{Delivered}(\text{source}_i) \le \text{Requested}_{\text{total}}$$
+   At all times, no source receives more than it is owed:
+   $$\forall k:\; D_k \le R - B_k$$
+   (The sum $\sum_k D_k$ may legitimately exceed $R$: demand requested but not yet emitted by a completed source is carried over to the next one.)
 2. **Liveness Invariant (No Loss):**  
-   The active upstream source must eventually receive all outstanding demand:
-   $$\lim_{t \to \infty} \text{Delivered}(\text{source}_{\text{active}}) = \text{Requested}_{\text{total}} - \text{Emitted}_{\text{total}}$$
+   Once calls stop, and unless cancelled, the active source $a$ has received everything it is owed (for bounded demand):
+   $$D_a = R - B_a$$
 
 These two invariants capture the dual hazards of "duplicated demand" and "lost demand" and serve as formal assertion predicates for randomized stress harnesses.
 
@@ -193,30 +196,31 @@ Tests executed on macOS AArch64 (Apple Silicon), Java JDK 8 bytecode compatibili
 ```text
                                   STATE COORDINATION DECISION TREE
 
-                             Does the operation require external
-                            side-effects & non-monotonic switching?
-                                         /        \
-                                       YES         NO
-                                       /             \
-                   Is I/O persistence required?       Use Level 4: Striped Counter
-                           /             \            (LongAdder / Commutative metrics)
-                         YES              NO
-                         /                  \
-            Expected ops/sec > 50K?          Lifecycle & Instance Count?
-                 /          \                  /           \
-               YES           NO          Per-Subscription  Singleton Core
-               /               \         (Short-lived)     (Long-lived)
-        Use Level 3:        Use Level 2a:      |                 |
-        Smart-Batching      Actor Mailbox  Use Lock+Mailbox  Use Level 2b:
-        (Disruptor/         (Simple logic) (PR #3677 pattern) WIP Drain Loop
-        TigerBeetle)
+                  Does the operation trigger external side effects or a
+                  non-monotonic step (re-targeting, resetting state)?
+                                    /        \
+                                  YES         NO
+                                  /             \
+              Is I/O persistence required?       Commutative accumulation is enough:
+                      /             \            Level 4 Striped Counter (LongAdder),
+                    YES              NO          if snapshot (non-atomic) reads are acceptable
+                    /                  \
+       Expected ops/sec > 50K?       Must effects run one caller at a time?
+            /          \               /                      \
+          YES           NO           YES                      NO
+          /               \           |                        |
+   Use Level 3:        Use Level 2a:  Use Level 2b: cooperative  Use Level 1: CAS loop
+   Smart-Batching      Actor Mailbox  drain (WIP counter, or     (claim with CAS/getAndSet,
+   (Disruptor/         (Simple logic) ServiceTalk tryAcquireLock then act once)
+   TigerBeetle)                       + mailbox, PR #3677). Pad
+                                      long-lived singletons only.
 ```
 
 ---
 
 ## 6. Conclusion & Recommendations
 
-1. **Do not use Sentinel CAS for complex state coordination:** ServiceTalk's experience with Issue #1672 proves that multi-state CAS sentinels without mutual exclusion create treacherous edge-case race conditions.
-2. **Do not attempt to CRDT-ize side-effect coordinators:** Reactive Streams demand delivery is an external, non-idempotent side effect governed by §2.7 serialization rules.
-3. **Use Explicit Locks + Mailboxes for short-lived, correctness-critical coordinators:** When instances are created frequently and the hot path is tens of nanoseconds, explicit locks with short critical sections (PR #3677) provide provable correctness without memory-padding overhead.
+1. **Be wary of multi-sentinel CAS state machines:** Issue #1672 shows how a branch designed for same-thread re-entry silently mis-handles a cross-thread overlap. Such races hide from ordinary tests (121 of 200,000 iterations in a micro-stress).
+2. **Do not try to CRDT-ize side-effect coordinators:** Reactive Streams demand delivery is an external, non-idempotent side effect, and §2.7 requires `request`/`cancel` calls to be serial.
+3. **Give external effects a single owner:** For short-lived coordinators that must serialize effects, a non-blocking drain (WIP counter or `tryAcquireLock`/`releaseLock`) with an atomic mailbox, as proposed in PR #3677 (under review), avoids both padding and blocking. Check such designs against the safety/liveness invariants of §3.3 instead of claiming correctness by construction.
 4. **Deploy Smart-Batching for long-lived, high-throughput engines:** For core ledgers and matching engines where persistence dominates, 64-byte padded RingBuffers with group commit deliver optimal hardware utilization and amortization.

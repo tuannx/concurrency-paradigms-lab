@@ -33,7 +33,7 @@ public class ConcurrencyParadigmsJmhBenchmark {
         ConcurrencyEngine mailboxEngine;
         ConcurrencyEngine drainEngine;
         ConcurrencyEngine disruptorEngine;
-        ConcurrencyEngine crdtEngine;
+        ConcurrencyEngine stripedEngine;
 
         @Setup(Level.Trial)
         public void setup() {
@@ -42,7 +42,7 @@ public class ConcurrencyParadigmsJmhBenchmark {
             mailboxEngine = ConcurrencyEngine.create(EngineType.ACTOR_MAILBOX, cfg);
             drainEngine = ConcurrencyEngine.create(EngineType.WIP_DRAIN_LOOP, cfg);
             disruptorEngine = ConcurrencyEngine.create(EngineType.SMART_BATCHING_DISRUPTOR, cfg);
-            crdtEngine = ConcurrencyEngine.create(EngineType.STRIPED_COUNTER, cfg);
+            stripedEngine = ConcurrencyEngine.create(EngineType.STRIPED_COUNTER, cfg);
         }
 
         @TearDown(Level.Trial)
@@ -51,7 +51,7 @@ public class ConcurrencyParadigmsJmhBenchmark {
             mailboxEngine.close();
             drainEngine.close();
             disruptorEngine.close();
-            crdtEngine.close();
+            stripedEngine.close();
         }
     }
 
@@ -76,7 +76,7 @@ public class ConcurrencyParadigmsJmhBenchmark {
     }
 
     @Benchmark
-    public long benchCommutativeCrdt(BenchmarkPlan plan) throws Exception {
-        return plan.crdtEngine.mutate(1L).get();
+    public long benchStripedCounter(BenchmarkPlan plan) throws Exception {
+        return plan.stripedEngine.mutate(1L).get();
     }
 }

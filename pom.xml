@@ -8,7 +8,7 @@
     <version>1.0.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <name>Concurrency Paradigms Lab: CAS vs Mailbox vs WIP Drain vs Smart Batching vs CRDT</name>
+    <name>Concurrency Paradigms Lab: CAS vs Mailbox vs WIP Drain vs Smart Batching vs Striped Counter</name>
     <description>Comprehensive benchmark lab and high-performance concurrency library targeting Java 8</description>
 
     <properties>

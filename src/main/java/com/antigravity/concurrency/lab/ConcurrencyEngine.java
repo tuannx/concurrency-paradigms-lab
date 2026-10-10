@@ -1,7 +1,7 @@
 package com.antigravity.concurrency.lab;
 
 import com.antigravity.concurrency.lab.core.cas.CasLoopEngine;
-import com.antigravity.concurrency.lab.core.crdt.CommutativeCrdtEngine;
+import com.antigravity.concurrency.lab.core.striped.StripedCounterEngine;
 import com.antigravity.concurrency.lab.core.disruptor.SmartBatchingDisruptorEngine;
 import com.antigravity.concurrency.lab.core.drain.WipDrainLoopEngine;
 import com.antigravity.concurrency.lab.core.mailbox.ActorMailboxEngine;
@@ -56,7 +56,7 @@ public final class ConcurrencyEngine implements StateEngine {
                 return new ConcurrencyEngine(new SmartBatchingDisruptorEngine(cfg));
             case STRIPED_COUNTER:
             case COMMUTATIVE_CRDT:
-                return new ConcurrencyEngine(new CommutativeCrdtEngine(cfg));
+                return new ConcurrencyEngine(new StripedCounterEngine(cfg));
             default:
                 throw new IllegalArgumentException("Unsupported engine type: " + type);
         }
@@ -78,7 +78,8 @@ public final class ConcurrencyEngine implements StateEngine {
     }
 
     /**
-     * Creates a Cooperative Lock-Free Drain Loop engine based on the ServiceTalk SequentialSubscription pattern.
+     * Creates a Cooperative Lock-Free Drain Loop engine (RxJava/Reactor-style WIP counter, not ServiceTalk's
+     * sentinel-CAS {@code SequentialSubscription}).
      */
     public static ConcurrencyEngine wipDrain(EngineConfig config) {
         return create(EngineType.WIP_DRAIN_LOOP, config);

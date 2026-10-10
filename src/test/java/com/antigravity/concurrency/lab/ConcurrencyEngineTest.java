@@ -87,9 +87,15 @@ public class ConcurrencyEngineTest {
         // Sub2 receives the cumulative pending demand since 0 items were emitted
         assertEquals(15L, requestedReceivedSub2.get());
 
-        // Verify Reactive Streams §3.9: non-positive request forwarded to source
-        AtomicLong invalidDemandReceived = new AtomicLong();
-        SequentialSubscriptionExplained.Subscription mockSub3 = new SequentialSubscriptionExplained.Subscription() {
+        // Verify Reactive Streams §3.9: non-positive request forwarded to source, sanitized like main
+        // (a negative n is kept, 0 becomes Long.MIN_VALUE).
+        assertEquals(-10L, invalidRequestForwardedToSource(-10));
+        assertEquals(Long.MIN_VALUE, invalidRequestForwardedToSource(0));
+    }
+
+    private static long invalidRequestForwardedToSource(long n) {
+        final AtomicLong invalidDemandReceived = new AtomicLong();
+        SequentialSubscriptionExplained.Subscription mockSub = new SequentialSubscriptionExplained.Subscription() {
             @Override
             public void request(long n) {
                 if (n <= 0) {
@@ -100,8 +106,44 @@ public class ConcurrencyEngineTest {
             @Override
             public void cancel() {}
         };
-        SequentialSubscriptionExplained seqSub3 = new SequentialSubscriptionExplained(mockSub3);
-        seqSub3.request(-10);
-        assertEquals(Long.MIN_VALUE, invalidDemandReceived.get());
+        new SequentialSubscriptionExplained(mockSub).request(n);
+        return invalidDemandReceived.get();
+    }
+
+    @Test
+    public void testSequentialSubscriptionExplainedReentrantSwitchDeliversDemandToLatestSource() {
+        final AtomicLong requestedFromLatest = new AtomicLong();
+        final SequentialSubscriptionExplained.Subscription latest =
+                new SequentialSubscriptionExplained.Subscription() {
+            @Override
+            public void request(long n) {
+                requestedFromLatest.addAndGet(n);
+            }
+
+            @Override
+            public void cancel() {}
+        };
+        final SequentialSubscriptionExplained[] seqSub = new SequentialSubscriptionExplained[1];
+        final SequentialSubscriptionExplained.Subscription completesSynchronously =
+                new SequentialSubscriptionExplained.Subscription() {
+            @Override
+            public void request(long n) {
+                // The source completes inside request(n) and the next source subscribes on the same thread.
+                seqSub[0].switchTo(latest);
+            }
+
+            @Override
+            public void cancel() {}
+        };
+        seqSub[0] = new SequentialSubscriptionExplained(new SequentialSubscriptionExplained.Subscription() {
+            @Override
+            public void request(long n) {}
+
+            @Override
+            public void cancel() {}
+        });
+        seqSub[0].request(15);
+        seqSub[0].switchTo(completesSynchronously);
+        assertEquals(15L, requestedFromLatest.get());
     }
 }
