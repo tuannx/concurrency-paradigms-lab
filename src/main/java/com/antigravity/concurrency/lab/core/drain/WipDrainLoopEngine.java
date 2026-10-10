@@ -6,33 +6,33 @@ import com.antigravity.concurrency.lab.EngineType;
 import com.antigravity.concurrency.lab.SimulatedIo;
 import com.antigravity.concurrency.lab.StateEngine;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * Level 2b: Cooperative Lock-Free Drain Loop (WIP Trampoline Pattern).
  *
- * <p>Directly inspired by {@code io.servicetalk.concurrent.api.SequentialSubscription}:
+ * <p>The classic RxJava/Reactor work-in-progress drain. (ServiceTalk's {@code SequentialSubscription} uses a sentinel
+ * CAS on {@code main}; PR #3677 proposes a {@code tryAcquireLock}/{@code releaseLock} drain instead.)
  * <ul>
- *   <li>Uses {@link AtomicIntegerFieldUpdater} and {@link AtomicLongFieldUpdater} for zero-allocation
- *       primitive volatile manipulation.</li>
+ *   <li>Uses an {@link AtomicIntegerFieldUpdater} on a volatile {@code wip} counter (no {@code AtomicInteger} object);
+ *       each request still allocates a future, a request holder and a queue node.</li>
  *   <li>Eliminates dedicated actor worker threads: Producer threads cooperatively execute work.</li>
  *   <li>The first thread to arrive acquires the WIP execution permit ({@code wip.getAndIncrement() == 0}).</li>
  *   <li>Subsequent threads deposit their request and atomically increment WIP, then immediately return.</li>
  *   <li>The executing thread drains all pending accumulated work in a cooperative loop (trampoline).</li>
  *   <li>Guarantees strict single-threaded serialized execution of the state machine without mutexes.</li>
+ *   <li>Like the smart-batching engine, a batch is persisted once and its futures complete only after that I/O.</li>
  * </ul>
  */
 public final class WipDrainLoopEngine implements StateEngine {
 
     private static final AtomicIntegerFieldUpdater<WipDrainLoopEngine> WIP_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(WipDrainLoopEngine.class, "wip");
-
-    private static final AtomicLongFieldUpdater<WipDrainLoopEngine> PENDING_DELTA_UPDATER =
-            AtomicLongFieldUpdater.newUpdater(WipDrainLoopEngine.class, "pendingDelta");
 
     private static final class PendingRequest {
         final long delta;
@@ -50,13 +50,14 @@ public final class WipDrainLoopEngine implements StateEngine {
     // Lock-free queue for request futures tracking
     private final Queue<PendingRequest> requestQueue = new ConcurrentLinkedQueue<PendingRequest>();
 
-    // Cooperative drain fields (updated via AtomicFieldUpdaters)
+    // Cooperative drain permit (updated via AtomicIntegerFieldUpdater)
     private volatile int wip = 0;
-    private volatile long pendingDelta = 0L;
 
     // State machine is mutated strictly during drain loops by the thread holding wip
     private long state = 0L;
     private volatile long readableState = 0L;
+    // Reused by the drain owner only (wip hand-off publishes it to the next owner)
+    private final List<PendingRequest> batch = new ArrayList<PendingRequest>();
 
     public WipDrainLoopEngine(EngineConfig config) {
         this.config = config;
@@ -68,9 +69,6 @@ public final class WipDrainLoopEngine implements StateEngine {
         final CompletableFuture<Long> future = new CompletableFuture<Long>();
         requestQueue.offer(new PendingRequest(delta, future));
 
-        // Atomically accumulate pending demand (similar to requestedUpdater in SequentialSubscription)
-        PENDING_DELTA_UPDATER.addAndGet(this, delta);
-
         // Cooperative drain permit acquisition:
         // If wip was 0, this thread won the right to drain. Otherwise, another active thread will drain it!
         if (WIP_UPDATER.getAndIncrement(this) == 0) {
@@ -81,29 +79,31 @@ public final class WipDrainLoopEngine implements StateEngine {
     }
 
     /**
-     * Trampoline drain loop guaranteeing single-threaded execution.
-     * Mirrors the re-entrancy / work-in-progress loop in ServiceTalk's SequentialSubscription.
+     * Trampoline drain loop guaranteeing single-threaded execution (classic WIP missed-counter loop).
      */
     private void drain() {
         int missed = 1;
         for (;;) {
-            // Drain all pending requests from queue
-            int processedInBatch = 0;
+            // Phase 1: apply every pending request in memory
             PendingRequest req;
             while ((req = requestQueue.poll()) != null) {
                 state += req.delta;
-                readableState = state;
-                processedInBatch++;
-                metrics.recordSuccess();
-                req.future.complete(state);
+                batch.add(req);
             }
 
-            if (processedInBatch > 0) {
-                // If I/O persistence is configured, it is executed once per drained batch
+            if (!batch.isEmpty()) {
+                readableState = state;
+                // Phase 2: persist the batch once
                 if (config.getSimulatedIoMicros() > 0) {
                     SimulatedIo.execute(config.getSimulatedIoMicros());
                 }
-                metrics.recordBatchFlush(processedInBatch);
+                // Phase 3: complete only after the I/O, with the batch's final state (as smart batching does)
+                for (PendingRequest done : batch) {
+                    done.future.complete(state);
+                }
+                metrics.recordBatchFlush(batch.size());
+                metrics.recordSuccess(batch.size());
+                batch.clear();
             }
 
             // Atomically subtract the missed count that was observed

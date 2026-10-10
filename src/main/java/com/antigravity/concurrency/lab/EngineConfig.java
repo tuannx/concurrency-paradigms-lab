@@ -6,13 +6,13 @@ package com.antigravity.concurrency.lab;
 public final class EngineConfig {
     private final int simulatedIoMicros;
     private final int bufferCapacity;
-    private final int crdtPartitions;
+    private final int stripeCount;
     private final int maxBatchSize;
 
     private EngineConfig(Builder builder) {
         this.simulatedIoMicros = builder.simulatedIoMicros;
         this.bufferCapacity = builder.bufferCapacity;
-        this.crdtPartitions = builder.crdtPartitions;
+        this.stripeCount = builder.stripeCount;
         this.maxBatchSize = builder.maxBatchSize;
     }
 
@@ -36,8 +36,16 @@ public final class EngineConfig {
         return bufferCapacity;
     }
 
+    public int getStripeCount() {
+        return stripeCount;
+    }
+
+    /**
+     * @deprecated Use {@link #getStripeCount()}; the striped counter is not a CRDT.
+     */
+    @Deprecated
     public int getCrdtPartitions() {
-        return crdtPartitions;
+        return stripeCount;
     }
 
     public int getMaxBatchSize() {
@@ -47,7 +55,7 @@ public final class EngineConfig {
     public static final class Builder {
         private int simulatedIoMicros = 0;
         private int bufferCapacity = 65536; // 64K slots
-        private int crdtPartitions = 16;
+        private int stripeCount = 16;
         private int maxBatchSize = 4096;
 
         public Builder simulatedIoMicros(int simulatedIoMicros) {
@@ -60,9 +68,17 @@ public final class EngineConfig {
             return this;
         }
 
-        public Builder crdtPartitions(int crdtPartitions) {
-            this.crdtPartitions = crdtPartitions;
+        public Builder stripeCount(int stripeCount) {
+            this.stripeCount = stripeCount;
             return this;
+        }
+
+        /**
+         * @deprecated Use {@link #stripeCount(int)}; the striped counter is not a CRDT.
+         */
+        @Deprecated
+        public Builder crdtPartitions(int crdtPartitions) {
+            return stripeCount(crdtPartitions);
         }
 
         public Builder maxBatchSize(int maxBatchSize) {
