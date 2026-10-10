@@ -156,38 +156,42 @@ These two invariants capture the dual hazards of "duplicated demand" and "lost d
 
 ## 4. Empirical Benchmark Results
 
-Tests executed on macOS AArch64 (Apple Silicon), Java JDK 8 bytecode compatibility, using `HdrHistogram` for microsecond latency tracking.
+Run on an Apple M1 Max (macOS, AArch64), OpenJDK 25.0.1 executing Java 8 bytecode, with `HdrHistogram` latency recording (`ConcurrencyLoadTestHarness`). Each scenario was run 3 times; the tables show the median of each metric and the throughput range across the runs. Run-to-run variance is large (up to ~2.5× for some engines), so treat smaller differences as noise.
+
+> **Changes since the first version of these tables:** the WIP drain engine used to complete futures *before* its batch I/O; it now completes them after the I/O, like the mailbox and smart-batching engines, so its Scenario 2 latencies include persistence. `STRIPED_COUNTER` was previously labelled `COMMUTATIVE_CRDT` (same code).
 
 ### 4.1 Scenario 1: Pure In-Memory High Contention (16 Threads, 640,000 Operations)
 
-| Paradigm Engine | Throughput (ops/s) | P50 (µs) | P90 (µs) | P99 (µs) | P99.9 (µs) | CAS Retries | Avg Batch Size |
-|---|---|---|---|---|---|---|---|
-| **CAS_LOOP** | 3,888,517 | 0.5 | 2.0 | 5.7 | 64.4 | **209,603** | 1.0 |
-| **ACTOR_MAILBOX** | 264,014 | 57.4 | 81.8 | 153.2 | 477.4 | 0 | 1.0 |
-| **WIP_DRAIN_LOOP** | 817,416 | **0.1** | 56.8 | 93.8 | 579.1 | 0 | 1.5 |
-| **SMART_BATCHING** | 272,929 | 51.0 | 70.6 | 159.7 | 1,302.5 | 0 | 10.9 |
-| **STRIPED_COUNTER** | 3,595,543 | **0.2** | **0.8** | **2.4** | **29.2** | **0** | 1.0 |
+| Paradigm Engine | Throughput (ops/s, median) | Throughput range | P50 (µs) | P90 (µs) | P99 (µs) | P99.9 (µs) | CAS Retries | Avg Batch Size |
+|---|---|---|---|---|---|---|---|---|
+| **CAS_LOOP** | 3,973,224 | 3.63M – 5.06M | 0.8 | 2.0 | 4.7 | 98.0 | **200,803** | 1.0 |
+| **ACTOR_MAILBOX** | 251,796 | 246k – 255k | 59.2 | 77.2 | 194.7 | 709.6 | 0 | 1.0 |
+| **WIP_DRAIN_LOOP** | 666,394 | 575k – 1.42M | **0.1** | 60.2 | 138.8 | 639.0 | 0 | 1.5 |
+| **SMART_BATCHING** | 222,959 | 148k – 274k | 57.1 | 74.6 | 270.3 | 2,609.2 | 0 | 12.0 |
+| **STRIPED_COUNTER** | 5,456,981 | 4.66M – 5.83M | 0.5 | 1.2 | 7.8 | 67.1 | **0** | 1.0 |
 
 *Key Insights:*
-- **The True Cost of CAS:** The CAS loop suffered **209,603 failed retry spins**, wasting CPU cycles on cache line invalidations.
-- **WIP Drain Loop:** Achieved a **0.1 µs P50 latency** and **3.1× higher throughput than the classic Actor Mailbox**, proving the efficiency of cooperative trampoline drain without dedicated actor threads.
-- **Striped Counter:** Achieved 3.6M ops/s with **zero retries** and an ultra-tight P99 latency of **2.4 µs**, albeit with weak snapshot read consistency.
+- **The Cost of CAS:** about 200,000 failed CAS retries per run, spent on cache-line invalidations.
+- **Striped Counter:** the highest throughput with zero retries, but `mutate()` returns a non-atomic snapshot sum, not the exact post-update value that CAS returns (§2, Level 4). The two rows do not measure the same guarantee.
+- **WIP Drain Loop:** a **0.1 µs P50** (most callers drain their own request inline) and about **2.6× the mailbox throughput**, with wide run-to-run variance.
+- **Smart Batching without I/O:** with nothing to amortize, the producer→consumer hand-off dominates (P50 57 µs); batching pays off in Scenario 2.
 
 ---
 
 ### 4.2 Scenario 2: Simulated I/O Persistence (8 Threads, 20 µs Commit Delay)
 
-| Paradigm Engine | Throughput (ops/s) | P50 (µs) | P90 (µs) | P99 (µs) | P99.9 (µs) | Avg Batch Size |
-|---|---|---|---|---|---|---|
-| **ACTOR_MAILBOX** | 38,324 | 187.6 | 224.5 | 751.6 | 2,246.7 | 1.0 |
-| **SMART_BATCHING** | 129,498 | 56.5 | 76.8 | 179.5 | **521.2** | **4.5** |
-| **WIP_DRAIN_LOOP** | 155,273 | 26.9 | 44.9 | 232.1 | 1,399.8 | **7.0** |
-| **CAS_LOOP** | 284,804 | 21.6 | 22.7 | 90.2 | 908.3 | 1.0 |
-| **STRIPED_COUNTER** | 269,790 | 21.5 | 22.5 | 86.0 | 918.5 | 1.0 |
+| Paradigm Engine | Throughput (ops/s, median) | Throughput range | P50 (µs) | P90 (µs) | P99 (µs) | P99.9 (µs) | Avg Batch Size |
+|---|---|---|---|---|---|---|---|
+| **ACTOR_MAILBOX** | 37,110 | 31k – 38k | 188.4 | 211.8 | 663.0 | 4,673.5 | 1.0 |
+| **WIP_DRAIN_LOOP** | 108,037 | 68k – 109k | 47.1 | 68.0 | 201.0 | 1,584.1 | **3.3** |
+| **SMART_BATCHING** | 123,469 | 62k – 145k | 53.2 | 82.8 | 285.7 | **657.4** | **5.2** |
+| **CAS_LOOP** | 195,353 | 193k – 290k | 21.2 | 22.6 | 228.1 | 2,066.4 | 1.0 |
+| **STRIPED_COUNTER** | 231,031 | 230k – 270k | 21.3 | 22.9 | 152.7 | 1,559.6 | 1.0 |
 
 *Key Insights:*
-- **Actor Mailbox Collapse:** Under 20 µs I/O, the 1-by-1 Actor Mailbox collapsed to **38,324 ops/s** because every message suffered serialized disk latency.
-- **Smart-Batching & WIP Drain:** Automatically grouped incoming requests into dynamic batches ($N \approx 4.5 - 7.0$), achieving **3.4× to 4.0× higher throughput** and cutting P99.9 tail latency from 2,246 µs down to 521 µs.
+- **Actor Mailbox Collapse:** one 20 µs I/O per message caps the mailbox near $1/T_{\text{io}}$ (37,110 ops/s measured, 50,000 theoretical).
+- **Smart-Batching & WIP Drain:** both persist once per batch (average batch 5.2 and 3.3) and reach **2.9× to 3.3× the mailbox throughput**; smart batching has the tightest P99.9 (657 µs vs 4,674 µs for the mailbox).
+- **Why CAS and the striped counter top this table:** each caller thread performs its own I/O, so up to 8 "commits" run in parallel and in no particular order. The mailbox, WIP drain and smart-batching engines persist one batch at a time. This row compares parallel, unordered persistence against serialized persistence, not the quality of the coordination scheme.
 
 ---
 

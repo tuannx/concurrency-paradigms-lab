@@ -123,23 +123,25 @@ sequenceDiagram
     autonumber
     actor T1 as Producer 1
     actor T2 as Producer 2
-    participant WIP as AtomicIntegerFieldUpdater (wip)
-    participant ACC as Accumulator (AtomicLong)
-    participant SM as Single-Threaded State Machine
+    participant Q as Request Queue (ConcurrentLinkedQueue)
+    participant WIP as wip (AtomicIntegerFieldUpdater)
+    participant SM as State + Simulated I/O
 
-    T1->>ACC: addAndGet(10) -> pending = 10
+    T1->>Q: offer(request +10)
     T1->>WIP: getAndIncrement() -> returns 0 (Turn Acquired!)
     Note over T1: T1 becomes the DRAIN WORKER!
 
-    T2->>ACC: addAndGet(20) -> pending = 30
+    T2->>Q: offer(request +20)
     T2->>WIP: getAndIncrement() -> returns 1 (>0, Turn Busy!)
-    Note over T2: T2 exits immediately! Zero blocking, zero context switch!
+    Note over T2: T2 returns its pending future immediately, no blocking
 
     Note over T1: Drain Loop Iteration 1
-    T1->>ACC: getAndSet(0) -> drains batch of 30
-    T1->>SM: Apply delta (+30) in memory
+    T1->>Q: poll() until empty -> batch of 2
+    T1->>SM: Apply deltas (+30) in memory
+    T1->>SM: Persist the batch once (I/O)
+    Note over T1,T2: Both futures complete only after the I/O
     T1->>WIP: addAndGet(-missed)
-    Note over T1: Checks if new work arrived. If 0 -> terminates cleanly!
+    Note over T1: If 0 -> terminates cleanly, else drains again
 ```
 
 ---

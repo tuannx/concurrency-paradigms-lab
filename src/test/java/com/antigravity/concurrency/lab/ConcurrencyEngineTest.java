@@ -9,6 +9,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class ConcurrencyEngineTest {
 
@@ -91,6 +92,26 @@ public class ConcurrencyEngineTest {
         // (a negative n is kept, 0 becomes Long.MIN_VALUE).
         assertEquals(-10L, invalidRequestForwardedToSource(-10));
         assertEquals(Long.MIN_VALUE, invalidRequestForwardedToSource(0));
+    }
+
+    @Test
+    public void testWipDrainCompletesOnlyAfterItsBatchIsPersisted() throws Exception {
+        final int ioMicros = 200_000; // parks 200 ms per drained batch
+        try (ConcurrencyEngine engine = ConcurrencyEngine.create(EngineType.WIP_DRAIN_LOOP,
+                EngineConfig.withSimulatedIo(ioMicros))) {
+            // The first caller becomes the drainer and sits in its batch I/O; the second caller's request is
+            // drained by it in the next batch and must not complete before that batch's I/O.
+            CompletableFuture<Long> first = CompletableFuture.supplyAsync(() -> engine.mutate(1L).join());
+            Thread.sleep(50);
+            long start = System.nanoTime();
+            engine.mutate(1L).get();
+            long waitedMicros = (System.nanoTime() - start) / 1000;
+            first.get();
+            // Expected ~150 ms if it completes before its own batch I/O, ~350 ms after it; 250 ms leaves margin both
+            // ways (parkNanos may return a little early or late).
+            assertTrue("completed before its batch was persisted, waited " + waitedMicros + " us",
+                    waitedMicros >= ioMicros * 5L / 4);
+        }
     }
 
     private static long invalidRequestForwardedToSource(long n) {
